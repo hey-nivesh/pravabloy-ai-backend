@@ -1,12 +1,21 @@
 import { Response, NextFunction } from 'express';
 import { supabase, AuthenticatedRequest } from './requireAuth';
 
-export const FREE_TIER_DAILY_LIMIT_MINUTES = 5;
+// ─── NOTE ON ARCHITECTURE ────────────────────────────────────────────────────
+// Voice session access is NO LONGER gated by this daily-minutes cap.
+// The WebSocket gateway (voiceGateway.ts) uses the server-level session pool
+// (sessionPool.ts) which gates on actual Gemini API concurrent capacity.
+//
+// This middleware remains for REST routes that may want a soft usage guard,
+// but the daily limit is set generously high to not interfere with free usage.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const FREE_TIER_DAILY_LIMIT_MINUTES = 999; // Effectively unlimited; actual cap is concurrent sessions
 
 /**
  * checkEntitlement middleware for Express routes.
- * Ensures the authenticated user has active usage allowance
- * (unlimited for 'pro' subscribers, capped for free tier).
+ * Ensures the authenticated user has active usage allowance.
+ * (Currently a no-op gate since the WS pool handles API capacity.)
  */
 export async function checkEntitlement(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   if (!req.user) {
@@ -21,7 +30,9 @@ export async function checkEntitlement(req: AuthenticatedRequest, res: Response,
       .single();
 
     if (error || !profile) {
-      return res.status(500).json({ error: 'Failed to verify entitlement' });
+      // Fail open — don't block if we can't read the profile
+      console.warn('[checkEntitlement] Could not verify profile, allowing request:', error?.message);
+      return next();
     }
 
     const isPro = profile.subscription_tier === 'pro';
@@ -37,12 +48,17 @@ export async function checkEntitlement(req: AuthenticatedRequest, res: Response,
 
     next();
   } catch (err) {
-    return res.status(500).json({ error: 'Entitlement check exception' });
+    // Fail open on exception — the session pool is the real safety valve
+    console.warn('[checkEntitlement] Exception during check, allowing request:', err);
+    return next();
   }
 }
 
 /**
- * Entitlement verification helper for WebSocket upgrades.
+ * Entitlement verification helper — kept for compatibility but no longer used
+ * as the WebSocket gate. Use the session pool (sessionPool.ts) instead.
+ *
+ * @deprecated Use acquireSession() from sessionPool.ts for WS gate.
  */
 export async function verifyUserEntitlement(userId: string): Promise<boolean> {
   const { data: profile, error } = await supabase
@@ -52,7 +68,7 @@ export async function verifyUserEntitlement(userId: string): Promise<boolean> {
     .single();
 
   if (error || !profile) {
-    return false;
+    return true; // Fail open — don't block on DB errors
   }
 
   if (profile.subscription_tier === 'pro') {

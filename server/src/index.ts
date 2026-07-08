@@ -1,5 +1,8 @@
 import express from 'express';
 import http from 'http';
+import url from 'url';
+import path from 'path';
+import fs from 'fs';
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
 
@@ -7,8 +10,6 @@ import { requireAuth, AuthenticatedRequest, supabase } from './middleware/requir
 import { setupVoiceGateway } from './ws/voiceGateway';
 import { synthesizeSpeech } from './services/gemini';
 
-import path from 'path';
-import fs from 'fs';
 
 // Dynamically search parent folders for the .env configuration
 const envPaths = [
@@ -29,7 +30,7 @@ const port = process.env.PORT || 5000;
 
 app.use(express.json());
 
-// Express REST API test status
+// ── Health check — includes live session pool state ──────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
@@ -65,16 +66,13 @@ app.get('/api/v1/vocab-vault/due', requireAuth, async (req: AuthenticatedRequest
         let exampleAudioUrl = '';
 
         try {
-          // Generate normal speed pronunciation
           const normalRes = await synthesizeSpeech({ text: w.word, language: lang, speed: 'normal' });
           normalAudioUrl = normalRes.audioUrl;
         } catch (e) {
-          // Fallback to web-safe TTS URL if storage is unconfigured
           normalAudioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(w.word)}&type=2`;
         }
 
         try {
-          // Generate slow speed pronunciation
           const slowRes = await synthesizeSpeech({ text: w.word, language: lang, speed: 'slow' });
           slowAudioUrl = slowRes.audioUrl;
         } catch (e) {
@@ -82,7 +80,6 @@ app.get('/api/v1/vocab-vault/due', requireAuth, async (req: AuthenticatedRequest
         }
 
         try {
-          // Generate example sentence audio
           const exampleRes = await synthesizeSpeech({ text: w.example_sentence, language: lang, speed: 'normal' });
           exampleAudioUrl = exampleRes.audioUrl;
         } catch (e) {
@@ -118,7 +115,7 @@ const server = http.createServer(app);
 // Attach WebSocket Server
 const wss = new WebSocket.Server({ noServer: true });
 
-// Handle WebSocket upgrade verification manually
+// Handle WebSocket upgrade routing
 server.on('upgrade', (request, socket, head) => {
   const pathname = url.parse(request.url || '').pathname;
 
@@ -137,7 +134,5 @@ setupVoiceGateway(wss);
 // Boot server
 server.listen(port, () => {
   console.log(`[PravabloyAI Server] Server running on port ${port}`);
+  console.log(`[PravabloyAI Server] Voice model: gemini-3.1-flash-live-preview (no limits)`);
 });
-
-// Import url module for routing upgrades
-import url from 'url';

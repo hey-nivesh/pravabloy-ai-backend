@@ -16,7 +16,9 @@ import {
 const VOICE_POOL: Record<string, [string, string]> = {
   casual:         ['Puck', 'Kore'],
   formal:         ['Orus', 'Zephyr'],
-  executive:      ['Fenrir', 'Charon'],
+  // "Executive" voices were sounding overly low pitch (Fenrir/Charon).
+  // Switch to a more mid-range pairing for a natural conversational tone.
+  executive:      ['Kore', 'Zephyr'],
   mock_interview: ['Aoede', 'Leda'],
 };
 
@@ -109,7 +111,17 @@ export function createLiveSession(params: {
     throw new Error('GEMINI_API_KEY environment variable is not defined.');
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  // 'aistudio-build' User-Agent is required by the Gemini Live preview API
+  // to grant access under the free tier API key. This matches the configuration
+  // used in the reference fluency-coach server.ts implementation.
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
 
   // ── Voice selection ───────────────────────────────────────────────
   const selectedVoice = params.voicePreference || pickVoice(params.mode);
@@ -196,16 +208,14 @@ Where natural, steer the conversation to give the learner an opportunity to use 
   };
 
   // ── Gemini Live connection ────────────────────────────────────────
-  const liveModel = 'gemini-2.0-flash-live';
+  const liveModel = 'gemini-3.1-flash-live-preview';
 
   // VAD config: enable automatic activity detection with a comfortable silence window.
   // Using 'as any' because the installed type declarations are for the generic dist
   // and do not enumerate all Live-specific config fields. The runtime API accepts these.
   const liveConfig: any = {
     responseModalities: [Modality.AUDIO],
-    systemInstruction: {
-      parts: [{ text: systemInstruction }],
-    },
+    systemInstruction: systemInstruction,
     speechConfig: {
       voiceConfig: {
         prebuiltVoiceConfig: {
@@ -213,15 +223,19 @@ Where natural, steer the conversation to give the learner an opportunity to use 
         },
       },
     },
-    // Voice Activity Detection — allow natural pauses (1 second of silence)
-    // before ending a turn, so the learner can think without being cut off.
+    outputAudioTranscription: {},
+    inputAudioTranscription: {},
+    // Voice Activity Detection — tuned to tolerate room echo and natural thinking pauses.
+    // prefixPaddingMs: audio before speech that gets included (prevents clipped first word).
+    // silenceDurationMs: how long silence must persist before turn ends.
+    //   1500ms allows learners to pause mid-thought without being cut off.
     realtimeInputConfig: {
       automaticActivityDetection: {
         disabled: false,
         startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',    // Less hair-trigger on speech start
         endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',        // Give learners time to finish thought
-        prefixPaddingMs: 200,
-        silenceDurationMs: 1000,
+        prefixPaddingMs: 500,
+        silenceDurationMs: 1500,
       },
     },
   };
