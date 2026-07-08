@@ -13,6 +13,8 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const requireAuth_1 = require("./middleware/requireAuth");
 const voiceGateway_1 = require("./ws/voiceGateway");
 const gemini_1 = require("./services/gemini");
+const analytics_1 = require("./services/analytics");
+const progress_1 = require("./services/progress");
 // Dynamically search parent folders for the .env configuration
 const envPaths = [
     path_1.default.join(process.cwd(), '.env'),
@@ -97,6 +99,72 @@ app.get('/api/v1/vocab-vault/due', requireAuth_1.requireAuth, async (req, res) =
     catch (err) {
         console.error('[REST Vocab] Failed to assemble daily list:', err.message);
         res.status(500).json({ error: 'Failed to retrieve vocab session.' });
+    }
+});
+app.post('/api/analyze-fluency', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    const { sessionId } = req.body ?? {};
+    if (!sessionId || typeof sessionId !== 'string') {
+        return res.status(400).json({ error: 'sessionId is required.' });
+    }
+    try {
+        const result = await (0, analytics_1.analyzeSessionById)(sessionId, userId);
+        return res.json({
+            ok: true,
+            report: result.report,
+            analysis: result.analysis,
+            transcriptTurnCount: result.transcript.length,
+            model: 'gemini-3.5-flash',
+        });
+    }
+    catch (error) {
+        console.error('[analyze-fluency] Failed:', error?.message ?? error);
+        return res.status(500).json({
+            ok: false,
+            error: error?.message ?? 'Failed to generate analysis.',
+        });
+    }
+});
+app.get('/api/progress/summary', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const summary = await (0, progress_1.getUserProgressSummary)(userId);
+        return res.json({ ok: true, summary });
+    }
+    catch (error) {
+        console.error('[progress-summary] Failed:', error?.message ?? error);
+        return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load progress summary.' });
+    }
+});
+app.get('/api/analytics/latest', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const report = await (0, progress_1.getLatestAnalyticsReport)(userId);
+        return res.json({ ok: true, report });
+    }
+    catch (error) {
+        console.error('[analytics-latest] Failed:', error?.message ?? error);
+        return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load latest analytics.' });
+    }
+});
+app.get('/api/analytics/report/:reportId', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    const reportId = req.params.reportId;
+    try {
+        const { data, error } = await requireAuth_1.supabase
+            .from('analytics_reports')
+            .select('*')
+            .eq('id', reportId)
+            .eq('user_id', userId)
+            .single();
+        if (error || !data) {
+            return res.status(404).json({ ok: false, error: 'Report not found.' });
+        }
+        return res.json({ ok: true, report: data });
+    }
+    catch (error) {
+        console.error('[analytics-report] Failed:', error?.message ?? error);
+        return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load report.' });
     }
 });
 // Create HTTP server wrapping Express

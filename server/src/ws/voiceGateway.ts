@@ -1,8 +1,9 @@
 import { IncomingMessage } from 'http';
 import WebSocket from 'ws';
 import url from 'url';
+import { SupabaseClient } from '@supabase/supabase-js';
 
-import { verifyToken } from '../middleware/requireAuth';
+import { createUserSupabase, supabaseAdmin, verifyToken } from '../middleware/requireAuth';
 import { createLiveSession, LiveSessionHandle } from '../services/gemini';
 import { getSessionRagContext } from '../services/rag';
 
@@ -14,43 +15,6 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
     const token = parsedUrl.query.token as string | undefined;
     const caseStudyId = (parsedUrl.query.caseStudyId as string) || 'ordering-coffee';
     const clientSessionId = parsedUrl.query.sessionId as string | undefined;
-
-    // Buffer Gemini PCM outputs and send fewer, larger websocket messages.
-    // This reduces the number of client-side audio file transitions (stutters)
-    // caused by handling every tiny PCM part as its own playback segment.
-    const PCM_SAMPLE_RATE = 16000;
-    const BYTES_PER_SAMPLE = 2; // int16 PCM
-    const BYTES_PER_SEC = PCM_SAMPLE_RATE * BYTES_PER_SAMPLE; // mono
-    const MIN_MERGE_BYTES = BYTES_PER_SEC * 1; // ~1s of audio before forced flush
-    const MAX_MERGE_MS = 600; // cap latency even if chunk sizes are small
-
-    let pendingAudioChunks: Buffer[] = [];
-    let pendingAudioBytes = 0;
-    let flushTimer: NodeJS.Timeout | null = null;
-
-    const flushAudio = () => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      if (pendingAudioBytes === 0) return;
-      if (ws.readyState !== WebSocket.OPEN) {
-        pendingAudioChunks = [];
-        pendingAudioBytes = 0;
-        return;
-      }
-
-      const merged = Buffer.concat(pendingAudioChunks);
-      pendingAudioChunks = [];
-      pendingAudioBytes = 0;
-
-      ws.send(
-        JSON.stringify({
-          event: 'audio',
-          payload: { base64: merged.toString('base64') },
-        }),
-      );
-    };
 
     // ── 1. Authenticate ────────────────────────────────────────────────
     if (!token) {
@@ -71,6 +35,9 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
 
     console.log(`[VoiceGateway] User ${user.id} authenticated. Case study: ${caseStudyId}`);
 
+    const sessionId = clientSessionId ?? `${user.id}-${Date.now()}`;
+    const userDb: SupabaseClient = createUserSupabase(token);
+
     // ── 2. Determine mode & fetch scenario ─────────────────────────────
     let mode: 'casual' | 'formal' | 'executive' | 'mock_interview' = 'casual';
     let scenarioPrompt = '';
@@ -78,8 +45,43 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
     if (caseStudyId === 'salary-negotiation') mode = 'executive';
     else if (caseStudyId === 'system-design') mode = 'mock_interview';
 
-    // ── 3. Connect directly to Gemini Live (no DB, no limits) ──────────
+    try {
+      const { data: caseStudy } = await supabaseAdmin
+        .from('case_studies')
+        .select('category, scenario_prompt')
+        .eq('id', caseStudyId)
+        .single();
+      if (caseStudy?.scenario_prompt) {
+        scenarioPrompt = String(caseStudy.scenario_prompt);
+      }
+      if (caseStudy?.category === 'executive') mode = 'executive';
+      else if (caseStudy?.category === 'mock_interview' || caseStudy?.category === 'interview') mode = 'mock_interview';
+      else if (caseStudy?.category === 'formal') mode = 'formal';
+      else if (caseStudy?.category === 'casual') mode = 'casual';
+    } catch (_) {
+      // Keep deterministic fallback mapping when case_studies is unavailable.
+    }
+
+    const { error: upsertErr } = await userDb
+      .from('voice_sessions')
+      .upsert({
+        id: sessionId,
+        user_id: user.id,
+        case_study_id: caseStudyId,
+        mode,
+        status: 'in_progress',
+        transcript: [],
+        live_pacing: [],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    if (upsertErr) {
+      console.error('[VoiceGateway] Failed to initialize voice_sessions row:', upsertErr.message);
+    }
+
+    // ── 3. Connect directly to Gemini Live ─────────────────────────────
     let liveSession: LiveSessionHandle | null = null;
+    let isFinalizing = false;
 
     try {
       const { ragContext } = await getSessionRagContext(user.id, caseStudyId);
@@ -90,9 +92,8 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
         mode,
         ragContext,
         scenarioPrompt,
-        // Session id is used for analytics_reports linking.
-        // If the client provided one, keep it stable; otherwise fall back.
-        sessionId: clientSessionId ?? `${user.id}-${Date.now()}`,  // ephemeral session ID
+        sessionId,
+        userDb,
       });
     } catch (err: any) {
       console.error('[VoiceGateway] Failed to create Gemini Live session:', err.message);
@@ -101,30 +102,45 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
       return;
     }
 
-    // ── 4. Wire up Gemini → Client callbacks ──────────────────────────
-    liveSession.onAudioOutput((chunk: Buffer) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      pendingAudioChunks.push(chunk);
-      pendingAudioBytes += chunk.length;
+    const finalizeSession = async (notifyClient: boolean): Promise<string | null> => {
+      if (isFinalizing) return null;
+      isFinalizing = true;
 
-      // Flush immediately once we've buffered enough audio.
-      if (pendingAudioBytes >= MIN_MERGE_BYTES) {
-        flushAudio();
-        return;
+      let reportId: string | null = null;
+      if (liveSession) {
+        const result = await liveSession.close();
+        reportId = result.reportId;
+        liveSession = null;
       }
 
-      // Otherwise flush shortly to avoid excessive latency.
-      if (!flushTimer) {
-        flushTimer = setTimeout(() => flushAudio(), MAX_MERGE_MS);
+      const { error: updateErr } = await userDb
+        .from('voice_sessions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', sessionId)
+        .eq('user_id', user.id)
+        .neq('status', 'completed');
+      if (updateErr) {
+        console.error('[VoiceGateway] Failed to finalize voice session status:', updateErr.message);
       }
-    });
 
-    liveSession.onTranscriptDelta((text: string, role: 'user' | 'agent') => {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (notifyClient && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
-          event: 'transcript',
-          payload: { text, sender: role === 'agent' ? 'ai' : 'user', isFinal: false },
+          event: 'session_analyzed',
+          payload: { sessionId, reportId },
         }));
+      }
+
+      return reportId;
+    };
+
+    // ── 4. Wire up Gemini → Client callbacks ──────────────────────────
+    liveSession.onMessage((message) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'message', data: message }));
       }
     });
 
@@ -135,14 +151,6 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
     });
 
     liveSession.onInterrupted(() => {
-      // Discard any queued audio when the model is interrupted (barge-in).
-      pendingAudioChunks = [];
-      pendingAudioBytes = 0;
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ event: 'interrupted' }));
       }
@@ -160,7 +168,6 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
       if (!liveSession) return;
 
       if (isBinary) {
-        // Raw PCM bytes (16kHz 16-bit mono) from the mobile mic
         const buffer = Buffer.isBuffer(message)
           ? message
           : Array.isArray(message)
@@ -172,6 +179,12 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
           const control = JSON.parse(message.toString());
           if (control.event === 'text' && control.payload?.text) {
             liveSession.sendTextEvent({ text: control.payload.text });
+          } else if (control.event === 'end_session') {
+            void finalizeSession(true).then(() => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.close(1000, 'Session ended');
+              }
+            });
           }
         } catch (_) {}
       }
@@ -180,16 +193,7 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
     // ── 6. Cleanup on disconnect ───────────────────────────────────────
     ws.on('close', async (code: number, reason: Buffer) => {
       console.log(`[VoiceGateway] Connection closed. Code=${code}, User=${user.id}`);
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      pendingAudioChunks = [];
-      pendingAudioBytes = 0;
-      if (liveSession) {
-        await liveSession.close();
-        liveSession = null;
-      }
+      await finalizeSession(false);
     });
 
     ws.on('error', (err) => {

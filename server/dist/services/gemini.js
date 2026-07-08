@@ -107,8 +107,7 @@ ${params.ragContext}
 Where natural, steer the conversation to give the learner an opportunity to use the vocabulary list above. Keep a mental note of notable grammar mistakes or filler-word usage, but do NOT correct them live. Correction is handled separately at the end of the session. Keep your spoken responses short (1-2 sentences) to encourage the user to speak more.
   `.trim();
     // ── Callback registry ─────────────────────────────────────────────
-    let audioOutputCb = null;
-    let transcriptDeltaCb = null;
+    let messageCb = null;
     let interruptedCb = null;
     let turnCompleteCb = null;
     let livePacingCb = null;
@@ -119,6 +118,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
     let sessionObject = null;
     const pendingAudioChunks = [];
     const accumulatedTranscript = [];
+    const livePacingFrames = [];
     let currentUserText = '';
     let currentAiText = '';
     // ── Live pacing state ─────────────────────────────────────────────
@@ -136,6 +136,11 @@ Where natural, steer the conversation to give the learner an opportunity to use 
             wpm = durationMin > 0 ? Math.round(currentUserWordCount / durationMin) : 0;
         }
         livePacingCb({ wpm, fillerCount: sessionFillerCount, pauseFlag });
+        livePacingFrames.push({
+            wpm,
+            fillerCount: sessionFillerCount,
+            pauseFlag,
+        });
     };
     // ── Transcript persistence ────────────────────────────────────────
     const saveTranscriptToDb = async () => {
@@ -144,6 +149,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
                 .from('voice_sessions')
                 .update({
                 transcript: accumulatedTranscript,
+                live_pacing: livePacingFrames,
                 updated_at: new Date().toISOString(),
             })
                 .eq('id', params.sessionId);
@@ -244,38 +250,25 @@ Where natural, steer the conversation to give the learner an opportunity to use 
                 const parts = message.serverContent?.modelTurn?.parts;
                 if (parts) {
                     for (const part of parts) {
-                        if (part.inlineData?.data) {
-                            const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
-                            if (audioOutputCb)
-                                audioOutputCb(audioBuffer);
-                        }
                         if (part.text) {
                             currentAiText += part.text;
-                            if (transcriptDeltaCb)
-                                transcriptDeltaCb(part.text, 'agent');
                         }
                     }
                 }
                 // C. User speech transcript delta (if STT output arrives)
-                const userParts = message.serverContent?.inputTranscription?.parts;
-                if (userParts) {
-                    for (const part of userParts) {
-                        if (part.text) {
-                            // Track for pacing
-                            if (lastUserTurnStartMs === 0)
-                                lastUserTurnStartMs = Date.now();
-                            const words = part.text.trim().split(/\s+/).filter(Boolean);
-                            currentUserWordCount += words.length;
-                            sessionFillerCount += countFillers(part.text);
-                            currentUserText += part.text;
-                            if (transcriptDeltaCb)
-                                transcriptDeltaCb(part.text, 'user');
-                            // Emit a pacing frame on each user speech delta
-                            const pauseFlag = lastUserSpeechEndMs > 0 &&
-                                lastUserTurnStartMs - lastUserSpeechEndMs > 3000;
-                            emitPacing(pauseFlag);
-                        }
-                    }
+                const userTranscriptText = message.serverContent?.inputTranscription?.text;
+                if (userTranscriptText) {
+                    // Track for pacing
+                    if (lastUserTurnStartMs === 0)
+                        lastUserTurnStartMs = Date.now();
+                    const words = userTranscriptText.trim().split(/\s+/).filter(Boolean);
+                    currentUserWordCount += words.length;
+                    sessionFillerCount += countFillers(userTranscriptText);
+                    currentUserText += userTranscriptText;
+                    // Emit a pacing frame on each user speech delta
+                    const pauseFlag = lastUserSpeechEndMs > 0 &&
+                        lastUserTurnStartMs - lastUserSpeechEndMs > 3000;
+                    emitPacing(pauseFlag);
                 }
                 // D. Turn complete
                 if (message.serverContent?.turnComplete) {
@@ -303,6 +296,8 @@ Where natural, steer the conversation to give the learner an opportunity to use 
                     if (turnCompleteCb)
                         turnCompleteCb(accumulatedTranscript);
                 }
+                if (messageCb)
+                    messageCb(message);
             },
             onerror: (err) => {
                 console.error(`[GeminiLiveSession] Gemini SDK WebSocket error:`, err);
@@ -388,16 +383,13 @@ Where natural, steer the conversation to give the learner an opportunity to use 
                 return;
             if (event.text) {
                 currentUserText += event.text;
-                if (transcriptDeltaCb)
-                    transcriptDeltaCb(event.text, 'user');
                 sessionObject.sendClientContent({
                     turns: [{ role: 'user', parts: [{ text: event.text }] }],
                     turnComplete: true,
                 });
             }
         },
-        onAudioOutput(callback) { audioOutputCb = callback; },
-        onTranscriptDelta(callback) { transcriptDeltaCb = callback; },
+        onMessage(callback) { messageCb = callback; },
         onInterrupted(callback) { interruptedCb = callback; },
         onTurnComplete(callback) { turnCompleteCb = callback; },
         onLivePacing(callback) { livePacingCb = callback; },

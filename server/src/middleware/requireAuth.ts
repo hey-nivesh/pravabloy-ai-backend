@@ -20,12 +20,34 @@ for (const envPath of envPaths) {
 
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 if (!supabaseUrl || !supabaseAnonKey) {
   console.warn('[requireAuth] Supabase configuration environment variables are missing.');
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Default client: service role when available (bypasses RLS for server jobs).
+const dbKey = supabaseServiceKey || supabaseAnonKey;
+export const supabase = createClient(supabaseUrl, dbKey);
+
+/** Admin client — always uses service role key. Falls back to default client. */
+export const supabaseAdmin = supabaseServiceKey
+  ? createClient(supabaseUrl, supabaseServiceKey)
+  : supabase;
+
+if (!supabaseServiceKey) {
+  console.warn(
+    '[requireAuth] SUPABASE_SERVICE_ROLE_KEY is not set. Server DB writes may fail under RLS. ' +
+      'Voice gateway will use per-user JWT clients as a fallback.',
+  );
+}
+
+/** Supabase client scoped to a user's JWT — satisfies RLS without service role. */
+export function createUserSupabase(accessToken: string) {
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+  });
+}
 
 export interface AuthenticatedRequest extends Request {
   user?: any;

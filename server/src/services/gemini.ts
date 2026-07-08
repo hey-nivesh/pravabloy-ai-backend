@@ -1,5 +1,6 @@
-import { GoogleGenAI, Modality } from '@google/genai';
-import { supabase } from '../middleware/requireAuth';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { supabaseAdmin } from '../middleware/requireAuth';
 import { triggerSessionAnalytics, TranscriptTurn } from './analytics';
 import {
   geminiRateLimiter,
@@ -76,13 +77,12 @@ export interface LivePacingFrame {
 export interface LiveSessionHandle {
   sendAudioChunk(chunk: Buffer): void;
   sendTextEvent(event: object): void;
-  onAudioOutput(callback: (chunk: Buffer) => void): void;
-  onTranscriptDelta(callback: (text: string, role: 'user' | 'agent') => void): void;
+  onMessage(callback: (message: LiveServerMessage) => void): void;
   onInterrupted(callback: () => void): void;
   onTurnComplete(callback: (fullTranscript: TranscriptTurn[]) => void): void;
   onLivePacing(callback: (frame: LivePacingFrame) => void): void;
   onError(callback: (err: Error) => void): void;
-  close(): Promise<void>;
+  close(): Promise<{ reportId: string | null }>;
 }
 
 // Hard maximum session duration (15 minutes)
@@ -102,9 +102,10 @@ export function createLiveSession(params: {
   caseStudyId: string;
   mode: 'casual' | 'formal' | 'executive' | 'mock_interview';
   ragContext: string;
-  scenarioPrompt?: string;   // From case_studies.scenario_prompt in DB
-  voicePreference?: string;  // Manual override; if omitted, voice pool is used
+  scenarioPrompt?: string;
+  voicePreference?: string;
   sessionId: string;
+  userDb?: SupabaseClient;
 }): LiveSessionHandle {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -158,8 +159,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
   `.trim();
 
   // ── Callback registry ─────────────────────────────────────────────
-  let audioOutputCb: ((chunk: Buffer) => void) | null = null;
-  let transcriptDeltaCb: ((text: string, role: 'user' | 'agent') => void) | null = null;
+  let messageCb: ((message: LiveServerMessage) => void) | null = null;
   let interruptedCb: (() => void) | null = null;
   let turnCompleteCb: ((fullTranscript: TranscriptTurn[]) => void) | null = null;
   let livePacingCb: ((frame: LivePacingFrame) => void) | null = null;
@@ -172,6 +172,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
   const pendingAudioChunks: Buffer[] = [];
 
   const accumulatedTranscript: TranscriptTurn[] = [];
+  const livePacingFrames: LivePacingFrame[] = [];
   let currentUserText = '';
   let currentAiText = '';
 
@@ -190,20 +191,27 @@ Where natural, steer the conversation to give the learner an opportunity to use 
       wpm = durationMin > 0 ? Math.round(currentUserWordCount / durationMin) : 0;
     }
     livePacingCb({ wpm, fillerCount: sessionFillerCount, pauseFlag });
+    livePacingFrames.push({
+      wpm,
+      fillerCount: sessionFillerCount,
+      pauseFlag,
+    });
   };
 
-  // ── Transcript persistence ────────────────────────────────────────
+  const sessionDb = params.userDb ?? supabaseAdmin;
+
   const saveTranscriptToDb = async () => {
-    try {
-      await supabase
-        .from('voice_sessions')
-        .update({
-          transcript: accumulatedTranscript,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', params.sessionId);
-    } catch (err: any) {
-      console.error('[GeminiLiveSession] Database transcript sync error:', err.message);
+    const { error: syncErr } = await sessionDb
+      .from('voice_sessions')
+      .update({
+        transcript: accumulatedTranscript,
+        live_pacing: livePacingFrames,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', params.sessionId)
+      .eq('user_id', params.userId);
+    if (syncErr) {
+      console.error('[GeminiLiveSession] Database transcript sync error:', syncErr.message);
     }
   };
 
@@ -290,7 +298,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
         }
       },
 
-      onmessage: async (message: any) => {
+      onmessage: async (message: LiveServerMessage) => {
         if (isClosed) return;
 
         // A. Barge-in / interruption
@@ -304,38 +312,28 @@ Where natural, steer the conversation to give the learner an opportunity to use 
         const parts = message.serverContent?.modelTurn?.parts;
         if (parts) {
           for (const part of parts) {
-            if (part.inlineData?.data) {
-              const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
-              if (audioOutputCb) audioOutputCb(audioBuffer);
-            }
             if (part.text) {
               currentAiText += part.text;
-              if (transcriptDeltaCb) transcriptDeltaCb(part.text, 'agent');
             }
           }
         }
 
         // C. User speech transcript delta (if STT output arrives)
-        const userParts = message.serverContent?.inputTranscription?.parts;
-        if (userParts) {
-          for (const part of userParts) {
-            if (part.text) {
-              // Track for pacing
-              if (lastUserTurnStartMs === 0) lastUserTurnStartMs = Date.now();
-              const words = part.text.trim().split(/\s+/).filter(Boolean);
-              currentUserWordCount += words.length;
-              sessionFillerCount += countFillers(part.text);
+        const userTranscriptText = message.serverContent?.inputTranscription?.text;
+        if (userTranscriptText) {
+          // Track for pacing
+          if (lastUserTurnStartMs === 0) lastUserTurnStartMs = Date.now();
+          const words = userTranscriptText.trim().split(/\s+/).filter(Boolean);
+          currentUserWordCount += words.length;
+          sessionFillerCount += countFillers(userTranscriptText);
 
-              currentUserText += part.text;
-              if (transcriptDeltaCb) transcriptDeltaCb(part.text, 'user');
+          currentUserText += userTranscriptText;
 
-              // Emit a pacing frame on each user speech delta
-              const pauseFlag =
-                lastUserSpeechEndMs > 0 &&
-                lastUserTurnStartMs - lastUserSpeechEndMs > 3000;
-              emitPacing(pauseFlag);
-            }
-          }
+          // Emit a pacing frame on each user speech delta
+          const pauseFlag =
+            lastUserSpeechEndMs > 0 &&
+            lastUserTurnStartMs - lastUserSpeechEndMs > 3000;
+          emitPacing(pauseFlag);
         }
 
         // D. Turn complete
@@ -364,6 +362,8 @@ Where natural, steer the conversation to give the learner an opportunity to use 
           await saveTranscriptToDb();
           if (turnCompleteCb) turnCompleteCb(accumulatedTranscript);
         }
+
+        if (messageCb) messageCb(message);
       },
 
       onerror: (err: any) => {
@@ -408,8 +408,8 @@ Where natural, steer the conversation to give the learner an opportunity to use 
     handleClose();
   }, MAX_SESSION_DURATION_MS);
 
-  const handleClose = async () => {
-    if (isClosed) return;
+  const handleClose = async (): Promise<{ reportId: string | null }> => {
+    if (isClosed) return { reportId: null };
     isClosed = true;
     clearTimeout(sessionTimeout);
     console.log(`[GeminiLiveSession] Closing session ${params.sessionId}`);
@@ -430,11 +430,13 @@ Where natural, steer the conversation to give the learner an opportunity to use 
     }
     await saveTranscriptToDb();
 
-    triggerSessionAnalytics(params.sessionId, params.userId, accumulatedTranscript);
+    const { reportId } = await triggerSessionAnalytics(params.sessionId, params.userId, accumulatedTranscript);
 
     if (sessionObject) {
       try { sessionObject.close(); } catch (_) { /* intentionally ignored */ }
     }
+
+    return { reportId };
   };
 
   // ── Public handle ─────────────────────────────────────────────────
@@ -451,15 +453,13 @@ Where natural, steer the conversation to give the learner an opportunity to use 
       if (isClosed || !isConnected || !sessionObject) return;
       if (event.text) {
         currentUserText += event.text;
-        if (transcriptDeltaCb) transcriptDeltaCb(event.text, 'user');
         sessionObject.sendClientContent({
           turns: [{ role: 'user', parts: [{ text: event.text }] }],
           turnComplete: true,
         });
       }
     },
-    onAudioOutput(callback) { audioOutputCb = callback; },
-    onTranscriptDelta(callback) { transcriptDeltaCb = callback; },
+    onMessage(callback) { messageCb = callback; },
     onInterrupted(callback) { interruptedCb = callback; },
     onTurnComplete(callback) { turnCompleteCb = callback; },
     onLivePacing(callback) { livePacingCb = callback; },
@@ -485,7 +485,7 @@ export async function synthesizeSpeech(params: {
 
   // 1. Cache lookup: check if the audio already exists in Supabase storage
   try {
-    const { data: existingFiles, error: listError } = await supabase.storage
+    const { data: existingFiles, error: listError } = await supabaseAdmin.storage
       .from(bucketName)
       .list('', {
         search: fileName,
@@ -494,7 +494,7 @@ export async function synthesizeSpeech(params: {
 
     if (!listError && existingFiles && existingFiles.length > 0 && existingFiles[0].name === fileName) {
       console.log(`[TTS Cache] Found cached TTS file for "${params.text}" (${params.speed})`);
-      const { data: signedData, error: signError } = await supabase.storage
+      const { data: signedData, error: signError } = await supabaseAdmin.storage
         .from(bucketName)
         .createSignedUrl(fileName, 365 * 24 * 60 * 60);
 
@@ -552,7 +552,7 @@ export async function synthesizeSpeech(params: {
 
   const audioBuffer = Buffer.from(audioBase64, 'base64');
 
-  const { error: uploadError } = await supabase.storage
+  const { error: uploadError } = await supabaseAdmin.storage
     .from(bucketName)
     .upload(fileName, audioBuffer, {
       contentType: 'audio/mp3',
@@ -564,7 +564,7 @@ export async function synthesizeSpeech(params: {
     throw new Error(`[TTS] Supabase upload failed: ${uploadError.message}`);
   }
 
-  const { data: signedData, error: signError } = await supabase.storage
+  const { data: signedData, error: signError } = await supabaseAdmin.storage
     .from(bucketName)
     .createSignedUrl(fileName, 365 * 24 * 60 * 60);
 
@@ -573,4 +573,50 @@ export async function synthesizeSpeech(params: {
   }
 
   return { audioUrl: signedData.signedUrl };
+}
+
+export async function generateAiVocab(language: string = 'en', limit: number = 5): Promise<any[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not defined.');
+
+  const ai = new GoogleGenAI({ apiKey });
+
+  const prompt = `Generate a JSON array of exactly ${limit} sophisticated, intermediate to advanced English vocabulary words that are highly useful for active spoken conversation (e.g., business discussions, casual storytelling, clear explanations).
+For each word, provide:
+- "word": string (capitalized)
+- "phonetic": string (in IPA slash format, e.g. /ɪˈlɒk.wənt/)
+- "part_of_speech": string (exactly one of: noun, verb, adjective, adverb, phrase)
+- "definition": string (rendered in English)
+- "example_sentence": string (illustrating natural spoken usage)
+- "usage_tip": string (nuance, conversational tip, or collocation)
+
+Provide ONLY raw JSON text. Do NOT wrap the JSON inside markdown code blocks.`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+
+    const text = response.text?.trim() || '[]';
+    const cleanedText = text.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
+    const parsed = JSON.parse(cleanedText);
+
+    if (Array.isArray(parsed)) {
+      return parsed.map((item, idx) => ({
+        id: `ai-${Date.now()}-${idx}`,
+        word: String(item.word),
+        phonetic: String(item.phonetic || ''),
+        part_of_speech: String(item.part_of_speech || 'noun').toLowerCase(),
+        definition: String(item.definition),
+        example_sentence: String(item.example_sentence),
+        usage_tip: String(item.usage_tip || ''),
+      }));
+    }
+  } catch (err: any) {
+    console.error('[GeminiVocab] Failed to generate AI vocabulary:', err.message);
+    throw new Error('AI vocabulary generation failed. Please try again.');
+  }
+
+  throw new Error('AI vocabulary generation returned invalid data.');
 }
