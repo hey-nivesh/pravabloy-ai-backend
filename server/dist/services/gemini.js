@@ -2,10 +2,14 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createLiveSession = createLiveSession;
 exports.synthesizeSpeech = synthesizeSpeech;
+exports.generateAiVocab = generateAiVocab;
 const genai_1 = require("@google/genai");
 const requireAuth_1 = require("../middleware/requireAuth");
 const analytics_1 = require("./analytics");
 const rateLimiter_1 = require("../utils/rateLimiter");
+const pcmToWav_1 = require("../utils/pcmToWav");
+/** Dedup concurrent TTS requests for the same text+speed hash */
+const inflightTts = new Map();
 // ─── Voice Pool ────────────────────────────────────────────────────────────────
 // Two voices per category: rotated randomly each session for variety.
 // Voice names from the Gemini Live API prebuilt voice catalogue (v2.10.0).
@@ -142,20 +146,19 @@ Where natural, steer the conversation to give the learner an opportunity to use 
             pauseFlag,
         });
     };
-    // ── Transcript persistence ────────────────────────────────────────
+    const sessionDb = params.userDb ?? requireAuth_1.supabaseAdmin;
     const saveTranscriptToDb = async () => {
-        try {
-            await requireAuth_1.supabase
-                .from('voice_sessions')
-                .update({
-                transcript: accumulatedTranscript,
-                live_pacing: livePacingFrames,
-                updated_at: new Date().toISOString(),
-            })
-                .eq('id', params.sessionId);
-        }
-        catch (err) {
-            console.error('[GeminiLiveSession] Database transcript sync error:', err.message);
+        const { error: syncErr } = await sessionDb
+            .from('voice_sessions')
+            .update({
+            transcript: accumulatedTranscript,
+            live_pacing: livePacingFrames,
+            updated_at: new Date().toISOString(),
+        })
+            .eq('id', params.sessionId)
+            .eq('user_id', params.userId);
+        if (syncErr) {
+            console.error('[GeminiLiveSession] Database transcript sync error:', syncErr.message);
         }
     };
     // ── Gemini Live connection ────────────────────────────────────────
@@ -339,7 +342,7 @@ Where natural, steer the conversation to give the learner an opportunity to use 
     }, MAX_SESSION_DURATION_MS);
     const handleClose = async () => {
         if (isClosed)
-            return;
+            return { reportId: null };
         isClosed = true;
         clearTimeout(sessionTimeout);
         console.log(`[GeminiLiveSession] Closing session ${params.sessionId}`);
@@ -358,13 +361,14 @@ Where natural, steer the conversation to give the learner an opportunity to use 
             });
         }
         await saveTranscriptToDb();
-        (0, analytics_1.triggerSessionAnalytics)(params.sessionId, params.userId, accumulatedTranscript);
+        const { reportId } = await (0, analytics_1.triggerSessionAnalytics)(params.sessionId, params.userId, accumulatedTranscript);
         if (sessionObject) {
             try {
                 sessionObject.close();
             }
             catch (_) { /* intentionally ignored */ }
         }
+        return { reportId };
     };
     // ── Public handle ─────────────────────────────────────────────────
     return {
@@ -401,23 +405,40 @@ Where natural, steer the conversation to give the learner an opportunity to use 
 // Synchronous TTS using Gemini's native audio output modality.
 // ─────────────────────────────────────────────────────────────────────────────
 async function synthesizeSpeech(params) {
+    const hash = (0, rateLimiter_1.getDeterministicHash)(params.text, params.speed);
+    const inflightKey = `${hash}:wav`;
+    const existing = inflightTts.get(inflightKey);
+    if (existing) {
+        console.log(`[TTS] Awaiting in-flight synthesis for hash ${hash.slice(0, 8)}…`);
+        return existing;
+    }
+    const work = synthesizeSpeechInner(params);
+    inflightTts.set(inflightKey, work);
+    try {
+        return await work;
+    }
+    finally {
+        inflightTts.delete(inflightKey);
+    }
+}
+async function synthesizeSpeechInner(params) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey)
         throw new Error('GEMINI_API_KEY is not defined.');
+    const debugContext = params.debugContext ?? (params.text.trim().includes(' ') ? 'example' : 'word');
+    console.log(`[TTS Debug] context=${debugContext} speed=${params.speed ?? 'normal'} ` +
+        `chars=${params.text.length} preview="${params.text.slice(0, 80)}${params.text.length > 80 ? '…' : ''}"`);
     const bucketName = 'vocab-audio';
     const hash = (0, rateLimiter_1.getDeterministicHash)(params.text, params.speed);
-    const fileName = `tts_${hash}.mp3`;
-    // 1. Cache lookup: check if the audio already exists in Supabase storage
+    const fileName = `tts_${hash}.wav`;
+    // 1. Cache lookup: download probe (list search is unreliable)
     try {
-        const { data: existingFiles, error: listError } = await requireAuth_1.supabase.storage
+        const { error: downloadError } = await requireAuth_1.supabaseAdmin.storage
             .from(bucketName)
-            .list('', {
-            search: fileName,
-            limit: 1,
-        });
-        if (!listError && existingFiles && existingFiles.length > 0 && existingFiles[0].name === fileName) {
+            .download(fileName);
+        if (!downloadError) {
             console.log(`[TTS Cache] Found cached TTS file for "${params.text}" (${params.speed})`);
-            const { data: signedData, error: signError } = await requireAuth_1.supabase.storage
+            const { data: signedData, error: signError } = await requireAuth_1.supabaseAdmin.storage
                 .from(bucketName)
                 .createSignedUrl(fileName, 365 * 24 * 60 * 60);
             if (!signError && signedData) {
@@ -431,6 +452,7 @@ async function synthesizeSpeech(params) {
     // 2. Synthesize using rate limiter queue, retries, and fallback to gemini-1.5-flash
     const ai = new genai_1.GoogleGenAI({ apiKey });
     let audioBase64;
+    let pcmMimeType;
     try {
         audioBase64 = await rateLimiter_1.geminiRateLimiter.enqueue(() => (0, rateLimiter_1.callWithModelFallback)('gemini-2.5-flash', 'gemini-1.5-flash', async (modelName) => {
             return (0, rateLimiter_1.callWithRetry)(async () => {
@@ -453,6 +475,7 @@ async function synthesizeSpeech(params) {
                 if (parts) {
                     for (const part of parts) {
                         if (part.inlineData?.data) {
+                            pcmMimeType = part.inlineData.mimeType ?? pcmMimeType;
                             return part.inlineData.data;
                         }
                     }
@@ -467,22 +490,66 @@ async function synthesizeSpeech(params) {
     if (!audioBase64) {
         throw new Error('[TTS] Gemini failed to output native audio content modality.');
     }
-    const audioBuffer = Buffer.from(audioBase64, 'base64');
-    const { error: uploadError } = await requireAuth_1.supabase.storage
+    const pcmBuffer = Buffer.from(audioBase64, 'base64');
+    const pcmMeta = (0, pcmToWav_1.parsePcmMimeType)(pcmMimeType);
+    const wavBuffer = (0, pcmToWav_1.pcmToWav)(pcmBuffer, pcmMeta);
+    const { error: uploadError } = await requireAuth_1.supabaseAdmin.storage
         .from(bucketName)
-        .upload(fileName, audioBuffer, {
-        contentType: 'audio/mp3',
+        .upload(fileName, wavBuffer, {
+        contentType: 'audio/wav',
         cacheControl: '3600',
-        upsert: false,
+        upsert: true,
     });
     if (uploadError) {
         throw new Error(`[TTS] Supabase upload failed: ${uploadError.message}`);
     }
-    const { data: signedData, error: signError } = await requireAuth_1.supabase.storage
+    console.log(`[TTS] Saved ${wavBuffer.length} byte WAV for "${params.text.slice(0, 40)}…" (${params.speed})`);
+    const { data: signedData, error: signError } = await requireAuth_1.supabaseAdmin.storage
         .from(bucketName)
         .createSignedUrl(fileName, 365 * 24 * 60 * 60);
     if (signError || !signedData) {
         throw new Error(`[TTS] Supabase URL signing failed: ${signError?.message || 'unknown error'}`);
     }
     return { audioUrl: signedData.signedUrl };
+}
+async function generateAiVocab(language = 'en', limit = 5) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey)
+        throw new Error('GEMINI_API_KEY is not defined.');
+    const ai = new genai_1.GoogleGenAI({ apiKey });
+    const prompt = `Generate a JSON array of exactly ${limit} sophisticated, intermediate to advanced English vocabulary words that are highly useful for active spoken conversation (e.g., business discussions, casual storytelling, clear explanations).
+For each word, provide:
+- "word": string (capitalized)
+- "phonetic": string (in IPA slash format, e.g. /ɪˈlɒk.wənt/)
+- "part_of_speech": string (exactly one of: noun, verb, adjective, adverb, phrase)
+- "definition": string (rendered in English)
+- "example_sentence": string (illustrating natural spoken usage)
+- "usage_tip": string (nuance, conversational tip, or collocation)
+
+Provide ONLY raw JSON text. Do NOT wrap the JSON inside markdown code blocks.`;
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+        });
+        const text = response.text?.trim() || '[]';
+        const cleanedText = text.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
+        const parsed = JSON.parse(cleanedText);
+        if (Array.isArray(parsed)) {
+            return parsed.map((item, idx) => ({
+                id: `ai-${Date.now()}-${idx}`,
+                word: String(item.word),
+                phonetic: String(item.phonetic || ''),
+                part_of_speech: String(item.part_of_speech || 'noun').toLowerCase(),
+                definition: String(item.definition),
+                example_sentence: String(item.example_sentence),
+                usage_tip: String(item.usage_tip || ''),
+            }));
+        }
+    }
+    catch (err) {
+        console.error('[GeminiVocab] Failed to generate AI vocabulary:', err.message);
+        throw new Error('AI vocabulary generation failed. Please try again.');
+    }
+    throw new Error('AI vocabulary generation returned invalid data.');
 }

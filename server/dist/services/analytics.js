@@ -82,7 +82,7 @@ async function getSessionContext(sessionRow) {
         difficulty: 'Intermediate',
     };
     try {
-        const { data, error } = await requireAuth_1.supabase
+        const { data, error } = await requireAuth_1.supabaseAdmin
             .from('case_studies')
             .select('category, scenario_prompt, difficulty')
             .eq('id', sessionRow?.case_study_id)
@@ -218,7 +218,7 @@ function buildShortTranscriptFallback(transcript, wpm, fillerCount) {
     };
 }
 async function insertReportWithFallback(reportInsert) {
-    const { data, error } = await requireAuth_1.supabase
+    const { data, error } = await requireAuth_1.supabaseAdmin
         .from('analytics_reports')
         .insert(reportInsert)
         .select('*')
@@ -235,7 +235,7 @@ async function insertReportWithFallback(reportInsert) {
         full_report: reportInsert.full_report,
         created_at: reportInsert.created_at,
     };
-    const { data: legacyData, error: legacyError } = await requireAuth_1.supabase
+    const { data: legacyData, error: legacyError } = await requireAuth_1.supabaseAdmin
         .from('analytics_reports')
         .insert(legacyInsert)
         .select('*')
@@ -245,7 +245,7 @@ async function insertReportWithFallback(reportInsert) {
     return legacyData;
 }
 async function analyzeSessionById(sessionId, userId, transcriptOverride) {
-    const { data: sessionRow, error: sessionErr } = await requireAuth_1.supabase
+    const { data: sessionRow, error: sessionErr } = await requireAuth_1.supabaseAdmin
         .from('voice_sessions')
         .select('*')
         .eq('id', sessionId)
@@ -307,7 +307,7 @@ async function analyzeSessionById(sessionId, userId, transcriptOverride) {
         created_at: new Date().toISOString(),
     };
     const persisted = await insertReportWithFallback(reportInsert);
-    await requireAuth_1.supabase
+    await requireAuth_1.supabaseAdmin
         .from('voice_sessions')
         .update({
         analytics_report_id: persisted.id,
@@ -325,10 +325,13 @@ async function analyzeSessionById(sessionId, userId, transcriptOverride) {
  */
 async function triggerSessionAnalytics(sessionId, userId, transcript) {
     try {
-        await analyzeSessionById(sessionId, userId, transcript);
+        const result = await analyzeSessionById(sessionId, userId, transcript);
+        const reportId = result.report?.id ? String(result.report.id) : null;
         console.log(`[Analytics Service] Successfully generated and stored report for session ${sessionId}`);
+        return { reportId };
     }
     catch (err) {
         console.error(`[Analytics Service] Failed generation error for session ${sessionId}:`, err.message);
+        return { reportId: null };
     }
 }

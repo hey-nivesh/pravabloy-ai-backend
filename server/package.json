@@ -6,11 +6,17 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "seed:vocabulary": "ts-node --transpile-only scripts/seedVocabularyCorpus.ts",
+    "prewarm:vocabulary": "ts-node --transpile-only scripts/prewarmEnrichment.ts"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@google/genai": "latest",
     "@supabase/supabase-js": "^2.48.0",
+    "compromise": "^14.14.4",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "ws": "^8.18.0"

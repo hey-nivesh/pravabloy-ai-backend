@@ -6,6 +6,10 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { createUserSupabase, supabaseAdmin, verifyToken } from '../middleware/requireAuth';
 import { createLiveSession, LiveSessionHandle } from '../services/gemini';
 import { getSessionRagContext } from '../services/rag';
+import { updateChallengeOnVoiceSession } from '../services/dailyChallenge';
+import { awardVoiceSessionXp } from '../services/xp';
+import { notifySessionComplete } from '../services/notifications';
+import { checkAndNotifyJourneyAchievements } from '../services/journeyMap';
 
 export function setupVoiceGateway(wss: WebSocket.Server) {
   wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
@@ -113,18 +117,52 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
         liveSession = null;
       }
 
+      const completedAt = new Date().toISOString();
+      const { data: sessionRow } = await userDb
+        .from('voice_sessions')
+        .select('created_at, status')
+        .eq('id', sessionId)
+        .eq('user_id', user.id)
+        .maybeSingle();
+
       const { error: updateErr } = await userDb
         .from('voice_sessions')
         .update({
           status: 'completed',
-          completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
+          completed_at: completedAt,
+          updated_at: completedAt,
         })
         .eq('id', sessionId)
         .eq('user_id', user.id)
         .neq('status', 'completed');
       if (updateErr) {
         console.error('[VoiceGateway] Failed to finalize voice session status:', updateErr.message);
+      }
+
+      if (sessionRow?.status !== 'completed') {
+        const startedAt = sessionRow?.created_at
+          ? new Date(sessionRow.created_at).getTime()
+          : Date.now();
+        const durationMinutes = Math.max(
+          1,
+          (new Date(completedAt).getTime() - startedAt) / 60_000,
+        );
+
+        void awardVoiceSessionXp(user.id, durationMinutes).then((xpResult) => {
+          if (xpResult) {
+            void notifySessionComplete(user.id, durationMinutes, xpResult.xpAwarded).catch(() => {});
+          }
+        }).catch((err) => {
+          console.warn('[VoiceGateway] XP award failed:', err?.message ?? err);
+        });
+
+        void updateChallengeOnVoiceSession(user.id, durationMinutes, Boolean(reportId)).catch(
+          (err) => {
+            console.warn('[VoiceGateway] Daily challenge update failed:', err?.message ?? err);
+          },
+        );
+
+        void checkAndNotifyJourneyAchievements(user.id).catch(() => {});
       }
 
       if (notifyClient && ws.readyState === WebSocket.OPEN) {

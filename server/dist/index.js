@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -12,10 +45,12 @@ const ws_1 = __importDefault(require("ws"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const requireAuth_1 = require("./middleware/requireAuth");
 const voiceGateway_1 = require("./ws/voiceGateway");
-const gemini_1 = require("./services/gemini");
 const analytics_1 = require("./services/analytics");
 const progress_1 = require("./services/progress");
-// Dynamically search parent folders for the .env configuration
+const discoverWords_1 = require("./services/vocabulary/discoverWords");
+const pronunciation_1 = require("./services/vocabulary/pronunciation");
+const streak_1 = require("./services/streak");
+const avatarUpload_1 = require("./services/profile/avatarUpload");
 const envPaths = [
     path_1.default.join(process.cwd(), '.env'),
     path_1.default.join(process.cwd(), '../.env'),
@@ -29,76 +64,225 @@ for (const envPath of envPaths) {
 }
 const app = (0, express_1.default)();
 const port = process.env.PORT || 5000;
-app.use(express_1.default.json());
-// ── Health check — includes live session pool state ──────────────────────────
+// Avatar uploads send base64 JSON — default 100kb limit is too small
+app.use(express_1.default.json({ limit: '15mb' }));
+app.use((err, req, res, next) => {
+    if (err?.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Image is too large (max 10 MB).' });
+    }
+    next(err);
+});
 app.get('/health', (req, res) => {
     res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
-/**
- * Vocab Vault Due REST API Endpoint:
- * Sourced by the Daily Word screen to fetch due words and synthesize their audio URLs.
- * Injects pronunciation URLs for normal-speed, slow-motion, and example sentences.
- */
+async function assembleVocabSession(params) {
+    const { userId, lang, limit } = params;
+    const now = new Date().toISOString();
+    const { data: dueWords } = await requireAuth_1.supabaseAdmin
+        .from('vocab_vault')
+        .select('*')
+        .eq('user_id', userId)
+        .or(`next_review_at.is.null,next_review_at.lte.${now}`)
+        .order('next_review_at', { ascending: true, nullsFirst: true })
+        .limit(limit);
+    if (dueWords && dueWords.length > 0) {
+        return (0, discoverWords_1.enrichDueVaultWords)({ rows: dueWords, lang });
+    }
+    const discovered = await (0, discoverWords_1.discoverCorpusWords)({ userId, limit, lang });
+    if (discovered.length > 0) {
+        return discovered;
+    }
+    console.warn('[VocabSession] Corpus empty or unavailable — falling back to on-demand AI vocab generation');
+    const { generateAiVocab } = await Promise.resolve().then(() => __importStar(require('./services/gemini')));
+    const generated = await generateAiVocab(lang, limit);
+    return generated.map((w, idx) => ({
+        id: w.id ?? `ai-${Date.now()}-${idx}`,
+        word: w.word,
+        phonetic: w.phonetic ?? '',
+        partOfSpeech: w.part_of_speech ?? 'noun',
+        definition: w.definition,
+        exampleSentence: w.example_sentence ?? w.exampleSentence,
+        usageTip: w.usage_tip ?? w.usageTip ?? '',
+        source: 'curated',
+        audioUrl: '',
+        slowAudioUrl: '',
+        exampleAudioUrl: '',
+        srsIntervalDays: 1,
+        srsEaseFactor: 2.5,
+    }));
+}
+app.get('/api/v1/vocab-vault/session', async (req, res) => {
+    const userId = req.query.userId || '';
+    const lang = req.query.lang || 'en';
+    const limit = parseInt(req.query.limit) || 5;
+    try {
+        if (!userId) {
+            return res.status(400).json({ error: 'userId is required.' });
+        }
+        const words = await assembleVocabSession({ userId, lang, limit });
+        res.json({ words });
+    }
+    catch (err) {
+        console.error('[REST Vocab] Failed to assemble session:', err.message);
+        res.status(500).json({ error: 'Failed to retrieve vocab session.' });
+    }
+});
 app.get('/api/v1/vocab-vault/due', requireAuth_1.requireAuth, async (req, res) => {
     const userId = req.user.id;
     const lang = req.query.lang || 'en';
+    const limit = parseInt(req.query.limit) || 5;
     try {
-        // 1. Fetch vocabulary items due for study
-        const { data: dbWords, error: dbError } = await requireAuth_1.supabase
-            .from('vocab_vault')
-            .select('*')
-            .eq('user_id', userId)
-            .limit(5);
-        // If database query returns empty, mock up a curated daily word list
-        const wordsList = dbWords && dbWords.length > 0 ? dbWords : [
-            { id: '1', word: 'Eloquent', phonetic: '/ˈɛl.ə.kwənt/', part_of_speech: 'adjective', definition: 'Fluent and persuasive in speaking or writing.', example_sentence: 'His eloquent words convinced the entire board.', usage_tip: 'Best for formal contexts.' },
-            { id: '2', word: 'Pragmatic', phonetic: '/præɡˈmæt.ɪk/', part_of_speech: 'adjective', definition: 'Sensible and realistic.', example_sentence: 'She took a pragmatic approach to the budget crisis.', usage_tip: 'Highly valued in management feedback.' }
-        ];
-        // 2. Synthesize audio speech URLs using Gemini TTS and package into response
-        const enrichedWords = await Promise.all(wordsList.map(async (w) => {
-            let normalAudioUrl = '';
-            let slowAudioUrl = '';
-            let exampleAudioUrl = '';
-            try {
-                const normalRes = await (0, gemini_1.synthesizeSpeech)({ text: w.word, language: lang, speed: 'normal' });
-                normalAudioUrl = normalRes.audioUrl;
-            }
-            catch (e) {
-                normalAudioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(w.word)}&type=2`;
-            }
-            try {
-                const slowRes = await (0, gemini_1.synthesizeSpeech)({ text: w.word, language: lang, speed: 'slow' });
-                slowAudioUrl = slowRes.audioUrl;
-            }
-            catch (e) {
-                slowAudioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(w.word)}&type=2`;
-            }
-            try {
-                const exampleRes = await (0, gemini_1.synthesizeSpeech)({ text: w.example_sentence, language: lang, speed: 'normal' });
-                exampleAudioUrl = exampleRes.audioUrl;
-            }
-            catch (e) {
-                exampleAudioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(w.example_sentence)}&type=2`;
-            }
-            return {
-                id: w.id,
-                word: w.word,
-                phonetic: w.phonetic,
-                partOfSpeech: w.part_of_speech,
-                definition: w.definition,
-                exampleSentence: w.example_sentence,
-                usageTip: w.usage_tip,
-                source: w.source || 'curated',
-                audioUrl: normalAudioUrl,
-                slowAudioUrl: slowAudioUrl,
-                exampleAudioUrl: exampleAudioUrl
-            };
-        }));
-        res.json({ words: enrichedWords });
+        const words = await assembleVocabSession({ userId, lang, limit });
+        res.json({ words });
     }
     catch (err) {
         console.error('[REST Vocab] Failed to assemble daily list:', err.message);
         res.status(500).json({ error: 'Failed to retrieve vocab session.' });
+    }
+});
+app.get('/api/v1/vocab-vault/search', async (req, res) => {
+    const q = req.query.q || '';
+    const lang = req.query.lang || 'en';
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    try {
+        const words = await (0, discoverWords_1.searchVocabulary)({ query: q, limit, lang });
+        res.json({ words });
+    }
+    catch (err) {
+        console.error('[REST Vocab] Search failed:', err.message);
+        res.status(500).json({ error: 'Vocabulary search failed.' });
+    }
+});
+app.get('/api/v1/vocab-vault/pronunciation', async (req, res) => {
+    const wordId = req.query.wordId || '';
+    const text = req.query.text || '';
+    const type = req.query.type || 'word';
+    const speed = req.query.speed || 'normal';
+    const lang = req.query.lang || 'en';
+    const format = req.query.format || 'json';
+    if (!wordId && !text) {
+        return res.status(400).json({ error: 'wordId or text is required.' });
+    }
+    try {
+        const audioUrl = text && !wordId
+            ? await (0, pronunciation_1.resolvePronunciationByText)({ text, type, speed, lang })
+            : await (0, pronunciation_1.resolvePronunciationUrl)({ wordId, type, speed, lang });
+        if (!audioUrl) {
+            return res.status(404).json({ error: 'Audio not available for this word.' });
+        }
+        if (format === 'json') {
+            return res.json({ audioUrl });
+        }
+        return res.redirect(302, audioUrl);
+    }
+    catch (err) {
+        console.error('[REST Vocab] Pronunciation failed:', err.message);
+        return res.status(500).json({ error: 'Failed to resolve pronunciation audio.' });
+    }
+});
+app.post('/api/v1/vocab-vault/:id/review', async (req, res) => {
+    const wordId = req.params.id;
+    const { userId, srs_interval_days: srsIntervalDays, srs_ease_factor: srsEaseFactor, next_review_at: nextReviewAt, } = req.body ?? {};
+    if (!wordId || !userId) {
+        return res.status(400).json({ error: 'wordId and userId are required.' });
+    }
+    if (wordId.startsWith('mock-')) {
+        return res.json({
+            next_review_at: nextReviewAt,
+            srs_interval_days: srsIntervalDays,
+        });
+    }
+    try {
+        const { error } = await requireAuth_1.supabaseAdmin
+            .from('vocab_vault')
+            .update({
+            srs_interval_days: srsIntervalDays ?? 1,
+            srs_ease_factor: srsEaseFactor ?? 2.5,
+            next_review_at: nextReviewAt ?? new Date(Date.now() + 86_400_000).toISOString(),
+            updated_at: new Date().toISOString(),
+        })
+            .eq('id', wordId)
+            .eq('user_id', userId);
+        if (error) {
+            throw new Error(error.message);
+        }
+        return res.json({
+            next_review_at: nextReviewAt,
+            srs_interval_days: srsIntervalDays,
+        });
+    }
+    catch (err) {
+        console.error('[REST Vocab] Review update failed:', err.message);
+        return res.status(500).json({ error: 'Failed to update review schedule.' });
+    }
+});
+app.post('/api/v1/streak/record', requireAuth_1.requireAuth, async (req, res) => {
+    try {
+        const result = await (0, streak_1.recordStreakActivity)(req.user.id);
+        return res.json({ ok: true, ...result });
+    }
+    catch (err) {
+        console.error('[streak] record failed:', err.message);
+        return res.status(500).json({ ok: false, error: err.message ?? 'Failed to record streak.' });
+    }
+});
+app.post('/api/profile/avatar', requireAuth_1.requireAuth, async (req, res) => {
+    const { imageBase64, mimeType } = req.body ?? {};
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+        return res.status(400).json({ error: 'imageBase64 is required.' });
+    }
+    const safeMime = typeof mimeType === 'string' && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
+    try {
+        const imageBuffer = Buffer.from(imageBase64, 'base64');
+        if (imageBuffer.length === 0) {
+            return res.status(400).json({ error: 'imageBase64 is empty.' });
+        }
+        if (imageBuffer.length > 10 * 1024 * 1024) {
+            return res.status(413).json({ error: 'Image is too large (max 10 MB).' });
+        }
+        const { secureUrl, publicId } = await (0, avatarUpload_1.uploadAvatarToCloudinary)({
+            imageBuffer,
+            mimeType: safeMime,
+            userId: req.user.id,
+        });
+        await (0, avatarUpload_1.persistUserAvatar)({
+            userId: req.user.id,
+            secureUrl,
+            publicId,
+        });
+        return res.json({ ok: true, secureUrl, publicId });
+    }
+    catch (err) {
+        console.error('[profile/avatar] upload failed:', err.message);
+        return res.status(500).json({ error: err.message ?? 'Avatar upload failed.' });
+    }
+});
+app.post('/api/v1/vocab-vault/prewarm', async (req, res) => {
+    const limit = Math.min(parseInt(req.body?.limit) || 5000, 10_000);
+    const lang = req.body?.lang || 'en';
+    try {
+        const { data: candidates } = await requireAuth_1.supabaseAdmin
+            .from('vocabulary_words')
+            .select('id')
+            .eq('is_enriched', false)
+            .order('frequency_rank', { ascending: true, nullsFirst: false })
+            .limit(limit);
+        const { enrichWord } = await Promise.resolve().then(() => __importStar(require('./services/vocabulary/enrichWord')));
+        let enriched = 0;
+        for (const row of candidates ?? []) {
+            try {
+                await enrichWord(row.id, lang);
+                enriched += 1;
+            }
+            catch (err) {
+                console.warn(`[prewarm] skipped ${row.id}:`, err.message);
+            }
+        }
+        return res.json({ ok: true, attempted: candidates?.length ?? 0, enriched });
+    }
+    catch (err) {
+        console.error('[prewarm] failed:', err.message);
+        return res.status(500).json({ error: 'Prewarm job failed.' });
     }
 });
 app.post('/api/analyze-fluency', requireAuth_1.requireAuth, async (req, res) => {
@@ -136,6 +320,72 @@ app.get('/api/progress/summary', requireAuth_1.requireAuth, async (req, res) => 
         return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load progress summary.' });
     }
 });
+app.get('/api/analytics/by-session/:sessionId', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    const sessionId = req.params.sessionId;
+    try {
+        const { data: sessionRow } = await requireAuth_1.supabaseAdmin
+            .from('voice_sessions')
+            .select('analytics_report_id, status, completed_at')
+            .eq('id', sessionId)
+            .eq('user_id', userId)
+            .maybeSingle();
+        if (!sessionRow) {
+            return res.status(404).json({ ok: false, error: 'Session not found.' });
+        }
+        if (!sessionRow.analytics_report_id) {
+            return res.json({ ok: true, ready: false, reportId: null });
+        }
+        return res.json({
+            ok: true,
+            ready: true,
+            reportId: sessionRow.analytics_report_id,
+            completedAt: sessionRow.completed_at,
+        });
+    }
+    catch (error) {
+        console.error('[analytics-by-session] Failed:', error?.message ?? error);
+        return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to check session analytics.' });
+    }
+});
+app.get('/api/voice-sessions/history', requireAuth_1.requireAuth, async (req, res) => {
+    const userId = req.user.id;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const offset = parseInt(req.query.offset) || 0;
+    try {
+        const { data, error } = await requireAuth_1.supabaseAdmin
+            .from('voice_sessions')
+            .select('id, case_study_id, mode, status, completed_at, created_at, updated_at, analytics_report_id, transcript')
+            .eq('user_id', userId)
+            .not('completed_at', 'is', null)
+            .order('completed_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+        if (error)
+            throw new Error(error.message);
+        const sessions = (data ?? []).map((row) => {
+            const durationSec = Math.max(0, Math.round((new Date(row.completed_at ?? row.updated_at).getTime() -
+                new Date(row.created_at).getTime()) /
+                1000));
+            const transcript = Array.isArray(row.transcript) ? row.transcript : [];
+            return {
+                id: row.id,
+                caseStudyId: row.case_study_id,
+                mode: row.mode,
+                status: row.status,
+                completedAt: row.completed_at,
+                createdAt: row.created_at,
+                durationSeconds: durationSec,
+                analyticsReportId: row.analytics_report_id,
+                turnCount: transcript.length,
+            };
+        });
+        return res.json({ ok: true, sessions });
+    }
+    catch (error) {
+        console.error('[voice-sessions-history] Failed:', error?.message ?? error);
+        return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load session history.' });
+    }
+});
 app.get('/api/analytics/latest', requireAuth_1.requireAuth, async (req, res) => {
     const userId = req.user.id;
     try {
@@ -167,11 +417,8 @@ app.get('/api/analytics/report/:reportId', requireAuth_1.requireAuth, async (req
         return res.status(500).json({ ok: false, error: error?.message ?? 'Failed to load report.' });
     }
 });
-// Create HTTP server wrapping Express
 const server = http_1.default.createServer(app);
-// Attach WebSocket Server
 const wss = new ws_1.default.Server({ noServer: true });
-// Handle WebSocket upgrade routing
 server.on('upgrade', (request, socket, head) => {
     const pathname = url_1.default.parse(request.url || '').pathname;
     if (pathname === '/ws/voice-session') {
@@ -183,9 +430,7 @@ server.on('upgrade', (request, socket, head) => {
         socket.destroy();
     }
 });
-// Setup Voice Gateway handler logic
 (0, voiceGateway_1.setupVoiceGateway)(wss);
-// Boot server
 server.listen(port, () => {
     console.log(`[PravabloyAI Server] Server running on port ${port}`);
     console.log(`[PravabloyAI Server] Voice model: gemini-3.1-flash-live-preview (no limits)`);

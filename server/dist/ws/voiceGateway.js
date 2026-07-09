@@ -34,6 +34,7 @@ function setupVoiceGateway(wss) {
         }
         console.log(`[VoiceGateway] User ${user.id} authenticated. Case study: ${caseStudyId}`);
         const sessionId = clientSessionId ?? `${user.id}-${Date.now()}`;
+        const userDb = (0, requireAuth_1.createUserSupabase)(token);
         // ── 2. Determine mode & fetch scenario ─────────────────────────────
         let mode = 'casual';
         let scenarioPrompt = '';
@@ -42,7 +43,7 @@ function setupVoiceGateway(wss) {
         else if (caseStudyId === 'system-design')
             mode = 'mock_interview';
         try {
-            const { data: caseStudy } = await requireAuth_1.supabase
+            const { data: caseStudy } = await requireAuth_1.supabaseAdmin
                 .from('case_studies')
                 .select('category, scenario_prompt')
                 .eq('id', caseStudyId)
@@ -62,26 +63,25 @@ function setupVoiceGateway(wss) {
         catch (_) {
             // Keep deterministic fallback mapping when case_studies is unavailable.
         }
-        try {
-            await requireAuth_1.supabase
-                .from('voice_sessions')
-                .upsert({
-                id: sessionId,
-                user_id: user.id,
-                case_study_id: caseStudyId,
-                mode,
-                status: 'in_progress',
-                transcript: [],
-                live_pacing: [],
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
-            });
+        const { error: upsertErr } = await userDb
+            .from('voice_sessions')
+            .upsert({
+            id: sessionId,
+            user_id: user.id,
+            case_study_id: caseStudyId,
+            mode,
+            status: 'in_progress',
+            transcript: [],
+            live_pacing: [],
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        });
+        if (upsertErr) {
+            console.error('[VoiceGateway] Failed to initialize voice_sessions row:', upsertErr.message);
         }
-        catch (sessionErr) {
-            console.warn('[VoiceGateway] Failed to initialize voice_sessions row:', sessionErr?.message ?? sessionErr);
-        }
-        // ── 3. Connect directly to Gemini Live (no DB, no limits) ──────────
+        // ── 3. Connect directly to Gemini Live ─────────────────────────────
         let liveSession = null;
+        let isFinalizing = false;
         try {
             const { ragContext } = await (0, rag_1.getSessionRagContext)(user.id, caseStudyId);
             liveSession = (0, gemini_1.createLiveSession)({
@@ -90,8 +90,8 @@ function setupVoiceGateway(wss) {
                 mode,
                 ragContext,
                 scenarioPrompt,
-                // Session id is used for transcript + analytics linkage.
                 sessionId,
+                userDb,
             });
         }
         catch (err) {
@@ -100,6 +100,37 @@ function setupVoiceGateway(wss) {
             ws.close(4011, 'Session Init Failed');
             return;
         }
+        const finalizeSession = async (notifyClient) => {
+            if (isFinalizing)
+                return null;
+            isFinalizing = true;
+            let reportId = null;
+            if (liveSession) {
+                const result = await liveSession.close();
+                reportId = result.reportId;
+                liveSession = null;
+            }
+            const { error: updateErr } = await userDb
+                .from('voice_sessions')
+                .update({
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+            })
+                .eq('id', sessionId)
+                .eq('user_id', user.id)
+                .neq('status', 'completed');
+            if (updateErr) {
+                console.error('[VoiceGateway] Failed to finalize voice session status:', updateErr.message);
+            }
+            if (notifyClient && ws.readyState === ws_1.default.OPEN) {
+                ws.send(JSON.stringify({
+                    event: 'session_analyzed',
+                    payload: { sessionId, reportId },
+                }));
+            }
+            return reportId;
+        };
         // ── 4. Wire up Gemini → Client callbacks ──────────────────────────
         liveSession.onMessage((message) => {
             if (ws.readyState === ws_1.default.OPEN) {
@@ -127,7 +158,6 @@ function setupVoiceGateway(wss) {
             if (!liveSession)
                 return;
             if (isBinary) {
-                // Raw PCM bytes (16kHz 16-bit mono) from the mobile mic
                 const buffer = Buffer.isBuffer(message)
                     ? message
                     : Array.isArray(message)
@@ -141,6 +171,13 @@ function setupVoiceGateway(wss) {
                     if (control.event === 'text' && control.payload?.text) {
                         liveSession.sendTextEvent({ text: control.payload.text });
                     }
+                    else if (control.event === 'end_session') {
+                        void finalizeSession(true).then(() => {
+                            if (ws.readyState === ws_1.default.OPEN) {
+                                ws.close(1000, 'Session ended');
+                            }
+                        });
+                    }
                 }
                 catch (_) { }
             }
@@ -148,25 +185,7 @@ function setupVoiceGateway(wss) {
         // ── 6. Cleanup on disconnect ───────────────────────────────────────
         ws.on('close', async (code, reason) => {
             console.log(`[VoiceGateway] Connection closed. Code=${code}, User=${user.id}`);
-            if (liveSession) {
-                await liveSession.close();
-                liveSession = null;
-            }
-            try {
-                await requireAuth_1.supabase
-                    .from('voice_sessions')
-                    .update({
-                    status: 'completed',
-                    completed_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString(),
-                })
-                    .eq('id', sessionId)
-                    .eq('user_id', user.id)
-                    .neq('status', 'completed');
-            }
-            catch (persistErr) {
-                console.warn('[VoiceGateway] Failed to finalize voice session status:', persistErr?.message ?? persistErr);
-            }
+            await finalizeSession(false);
         });
         ws.on('error', (err) => {
             console.warn('[VoiceGateway] WebSocket error:', err.message);

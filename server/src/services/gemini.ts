@@ -8,6 +8,10 @@ import {
   callWithModelFallback,
   getDeterministicHash
 } from '../utils/rateLimiter';
+import { parsePcmMimeType, pcmToWav } from '../utils/pcmToWav';
+
+/** Dedup concurrent TTS requests for the same text+speed hash */
+const inflightTts = new Map<string, Promise<{ audioUrl: string }>>();
 
 // ─── Voice Pool ────────────────────────────────────────────────────────────────
 // Two voices per category: rotated randomly each session for variety.
@@ -475,24 +479,53 @@ export async function synthesizeSpeech(params: {
   text: string;
   language?: string;
   speed?: 'normal' | 'slow';
+  /** Temporary debug label for tracing word vs example TTS paths */
+  debugContext?: 'word' | 'word-slow' | 'example' | string;
+}): Promise<{ audioUrl: string }> {
+  const hash = getDeterministicHash(params.text, params.speed);
+  const inflightKey = `${hash}:wav`;
+
+  const existing = inflightTts.get(inflightKey);
+  if (existing) {
+    console.log(`[TTS] Awaiting in-flight synthesis for hash ${hash.slice(0, 8)}…`);
+    return existing;
+  }
+
+  const work = synthesizeSpeechInner(params);
+  inflightTts.set(inflightKey, work);
+  try {
+    return await work;
+  } finally {
+    inflightTts.delete(inflightKey);
+  }
+}
+
+async function synthesizeSpeechInner(params: {
+  text: string;
+  language?: string;
+  speed?: 'normal' | 'slow';
+  debugContext?: 'word' | 'word-slow' | 'example' | string;
 }): Promise<{ audioUrl: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not defined.');
 
+  const debugContext = params.debugContext ?? (params.text.trim().includes(' ') ? 'example' : 'word');
+  console.log(
+    `[TTS Debug] context=${debugContext} speed=${params.speed ?? 'normal'} ` +
+      `chars=${params.text.length} preview="${params.text.slice(0, 80)}${params.text.length > 80 ? '…' : ''}"`,
+  );
+
   const bucketName = 'vocab-audio';
   const hash = getDeterministicHash(params.text, params.speed);
-  const fileName = `tts_${hash}.mp3`;
+  const fileName = `tts_${hash}.wav`;
 
-  // 1. Cache lookup: check if the audio already exists in Supabase storage
+  // 1. Cache lookup: download probe (list search is unreliable)
   try {
-    const { data: existingFiles, error: listError } = await supabaseAdmin.storage
+    const { error: downloadError } = await supabaseAdmin.storage
       .from(bucketName)
-      .list('', {
-        search: fileName,
-        limit: 1,
-      });
+      .download(fileName);
 
-    if (!listError && existingFiles && existingFiles.length > 0 && existingFiles[0].name === fileName) {
+    if (!downloadError) {
       console.log(`[TTS Cache] Found cached TTS file for "${params.text}" (${params.speed})`);
       const { data: signedData, error: signError } = await supabaseAdmin.storage
         .from(bucketName)
@@ -509,6 +542,7 @@ export async function synthesizeSpeech(params: {
   // 2. Synthesize using rate limiter queue, retries, and fallback to gemini-1.5-flash
   const ai = new GoogleGenAI({ apiKey });
   let audioBase64: string | undefined;
+  let pcmMimeType: string | undefined;
 
   try {
     audioBase64 = await geminiRateLimiter.enqueue(() =>
@@ -534,6 +568,7 @@ export async function synthesizeSpeech(params: {
           if (parts) {
             for (const part of parts) {
               if (part.inlineData?.data) {
+                pcmMimeType = part.inlineData.mimeType ?? pcmMimeType;
                 return part.inlineData.data;
               }
             }
@@ -550,19 +585,23 @@ export async function synthesizeSpeech(params: {
     throw new Error('[TTS] Gemini failed to output native audio content modality.');
   }
 
-  const audioBuffer = Buffer.from(audioBase64, 'base64');
+  const pcmBuffer = Buffer.from(audioBase64, 'base64');
+  const pcmMeta = parsePcmMimeType(pcmMimeType);
+  const wavBuffer = pcmToWav(pcmBuffer, pcmMeta);
 
   const { error: uploadError } = await supabaseAdmin.storage
     .from(bucketName)
-    .upload(fileName, audioBuffer, {
-      contentType: 'audio/mp3',
+    .upload(fileName, wavBuffer, {
+      contentType: 'audio/wav',
       cacheControl: '3600',
-      upsert: false,
+      upsert: true,
     });
 
   if (uploadError) {
     throw new Error(`[TTS] Supabase upload failed: ${uploadError.message}`);
   }
+
+  console.log(`[TTS] Saved ${wavBuffer.length} byte WAV for "${params.text.slice(0, 40)}…" (${params.speed})`);
 
   const { data: signedData, error: signError } = await supabaseAdmin.storage
     .from(bucketName)
