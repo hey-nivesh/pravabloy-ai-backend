@@ -51,6 +51,10 @@ const discoverWords_1 = require("./services/vocabulary/discoverWords");
 const pronunciation_1 = require("./services/vocabulary/pronunciation");
 const streak_1 = require("./services/streak");
 const avatarUpload_1 = require("./services/profile/avatarUpload");
+const dailyChallenge_1 = require("./services/dailyChallenge");
+const xp_1 = require("./services/xp");
+const journeyMap_1 = require("./services/journeyMap");
+const notifications_1 = require("./services/notifications");
 const envPaths = [
     path_1.default.join(process.cwd(), '.env'),
     path_1.default.join(process.cwd(), '../.env'),
@@ -63,7 +67,27 @@ for (const envPath of envPaths) {
     }
 }
 const app = (0, express_1.default)();
-const port = process.env.PORT || 5000;
+const port = Number(process.env.PORT) || 5000;
+const isProduction = process.env.NODE_ENV === 'production';
+if (isProduction) {
+    app.set('trust proxy', 1);
+}
+const allowedOrigins = (process.env.CORS_ORIGINS ?? '*')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes('*') || (origin && allowedOrigins.includes(origin))) {
+        res.setHeader('Access-Control-Allow-Origin', origin ?? '*');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+    }
+    next();
+});
 // Avatar uploads send base64 JSON — default 100kb limit is too small
 app.use(express_1.default.json({ limit: '15mb' }));
 app.use((err, req, res, next) => {
@@ -206,6 +230,15 @@ app.post('/api/v1/vocab-vault/:id/review', async (req, res) => {
         if (error) {
             throw new Error(error.message);
         }
+        const mastered = req.body?.response === 'got_it';
+        if (mastered) {
+            void (0, xp_1.awardVocabMasteredXp)(userId).catch((xpErr) => {
+                console.warn('[REST Vocab] XP award failed:', xpErr?.message ?? xpErr);
+            });
+        }
+        void (0, dailyChallenge_1.updateChallengeOnVocabReview)(userId, mastered).catch((challengeErr) => {
+            console.warn('[REST Vocab] Daily challenge update failed:', challengeErr?.message ?? challengeErr);
+        });
         return res.json({
             next_review_at: nextReviewAt,
             srs_interval_days: srsIntervalDays,
@@ -214,6 +247,50 @@ app.post('/api/v1/vocab-vault/:id/review', async (req, res) => {
     catch (err) {
         console.error('[REST Vocab] Review update failed:', err.message);
         return res.status(500).json({ error: 'Failed to update review schedule.' });
+    }
+});
+app.get('/api/v1/daily-challenge/today', requireAuth_1.requireAuth, async (req, res) => {
+    try {
+        const challenge = await (0, dailyChallenge_1.getOrCreateTodayChallenge)(req.user.id);
+        return res.json({ ok: true, challenge });
+    }
+    catch (err) {
+        console.error('[daily-challenge] fetch failed:', err.message);
+        return res.status(500).json({ ok: false, error: err.message ?? 'Failed to load daily challenge.' });
+    }
+});
+app.get('/api/v1/journey-map', requireAuth_1.requireAuth, async (req, res) => {
+    try {
+        const progress = await (0, journeyMap_1.getJourneyMapProgress)(req.user.id);
+        return res.json({ ok: true, ...progress });
+    }
+    catch (err) {
+        console.error('[journey-map] fetch failed:', err.message);
+        return res.status(500).json({ ok: false, error: err.message ?? 'Failed to load journey map.' });
+    }
+});
+app.get('/api/v1/notifications', requireAuth_1.requireAuth, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+        const notifications = await (0, notifications_1.listNotifications)(req.user.id, limit);
+        const unreadCount = await (0, notifications_1.countUnreadNotifications)(req.user.id);
+        return res.json({ ok: true, notifications, unreadCount });
+    }
+    catch (err) {
+        console.error('[notifications] list failed:', err.message);
+        return res.status(500).json({ ok: false, error: err.message ?? 'Failed to load notifications.' });
+    }
+});
+app.post('/api/v1/notifications/read', requireAuth_1.requireAuth, async (req, res) => {
+    try {
+        const notificationId = req.body?.notificationId;
+        await (0, notifications_1.markNotificationsRead)(req.user.id, notificationId);
+        const unreadCount = await (0, notifications_1.countUnreadNotifications)(req.user.id);
+        return res.json({ ok: true, unreadCount });
+    }
+    catch (err) {
+        console.error('[notifications] mark read failed:', err.message);
+        return res.status(500).json({ ok: false, error: err.message ?? 'Failed to mark notifications read.' });
     }
 });
 app.post('/api/v1/streak/record', requireAuth_1.requireAuth, async (req, res) => {

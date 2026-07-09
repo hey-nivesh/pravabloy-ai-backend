@@ -9,6 +9,10 @@ const url_1 = __importDefault(require("url"));
 const requireAuth_1 = require("../middleware/requireAuth");
 const gemini_1 = require("../services/gemini");
 const rag_1 = require("../services/rag");
+const dailyChallenge_1 = require("../services/dailyChallenge");
+const xp_1 = require("../services/xp");
+const notifications_1 = require("../services/notifications");
+const journeyMap_1 = require("../services/journeyMap");
 function setupVoiceGateway(wss) {
     wss.on('connection', async (ws, req) => {
         console.log('[VoiceGateway] New WebSocket connection attempt...');
@@ -110,18 +114,42 @@ function setupVoiceGateway(wss) {
                 reportId = result.reportId;
                 liveSession = null;
             }
+            const completedAt = new Date().toISOString();
+            const { data: sessionRow } = await userDb
+                .from('voice_sessions')
+                .select('created_at, status')
+                .eq('id', sessionId)
+                .eq('user_id', user.id)
+                .maybeSingle();
             const { error: updateErr } = await userDb
                 .from('voice_sessions')
                 .update({
                 status: 'completed',
-                completed_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
+                completed_at: completedAt,
+                updated_at: completedAt,
             })
                 .eq('id', sessionId)
                 .eq('user_id', user.id)
                 .neq('status', 'completed');
             if (updateErr) {
                 console.error('[VoiceGateway] Failed to finalize voice session status:', updateErr.message);
+            }
+            if (sessionRow?.status !== 'completed') {
+                const startedAt = sessionRow?.created_at
+                    ? new Date(sessionRow.created_at).getTime()
+                    : Date.now();
+                const durationMinutes = Math.max(1, (new Date(completedAt).getTime() - startedAt) / 60_000);
+                void (0, xp_1.awardVoiceSessionXp)(user.id, durationMinutes).then((xpResult) => {
+                    if (xpResult) {
+                        void (0, notifications_1.notifySessionComplete)(user.id, durationMinutes, xpResult.xpAwarded).catch(() => { });
+                    }
+                }).catch((err) => {
+                    console.warn('[VoiceGateway] XP award failed:', err?.message ?? err);
+                });
+                void (0, dailyChallenge_1.updateChallengeOnVoiceSession)(user.id, durationMinutes, Boolean(reportId)).catch((err) => {
+                    console.warn('[VoiceGateway] Daily challenge update failed:', err?.message ?? err);
+                });
+                void (0, journeyMap_1.checkAndNotifyJourneyAchievements)(user.id).catch(() => { });
             }
             if (notifyClient && ws.readyState === ws_1.default.OPEN) {
                 ws.send(JSON.stringify({

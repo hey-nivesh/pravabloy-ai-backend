@@ -49,7 +49,31 @@ EXPO_PUBLIC_API_BASE_URL=https://pravabloyai-api.onrender.com
 
 Rebuild or restart Expo after changing env.
 
-## Step 4 — Verify production
+## Troubleshooting failed deploys
+
+### `Exited with status 1 while building your code`
+
+**Most common causes:**
+
+1. **`package-lock.json` not in GitHub**  
+   `apps/.gitignore` previously ignored lockfiles. The Dockerfile runs `npm ci`, which **requires** `apps/server/package-lock.json`.  
+   **Fix:** commit and push `apps/server/package-lock.json`, then redeploy.
+
+2. **Wrong Root Directory (Node runtime, not Docker)**  
+   If you created a **Node** Web Service (not Docker), set:
+   - **Root Directory:** `apps/server`
+   - **Build Command:** `npm install && npm run build`
+   - **Start Command:** `npm start`  
+   Do **not** use the repo root — there is no `package.json` there.
+
+3. **Docker service paths**  
+   If using Docker:
+   - **Root Directory:** leave empty (repo root) OR set per Render Docker docs
+   - **Dockerfile path:** `apps/server/Dockerfile`
+   - **Docker context:** `apps/server`
+
+4. **Missing env vars** cause **runtime** failures, not build failures — set Supabase + `GOOGLE_API_KEY` before testing `/health`.
+
 
 ```bash
 curl https://YOUR-SERVICE.onrender.com/health

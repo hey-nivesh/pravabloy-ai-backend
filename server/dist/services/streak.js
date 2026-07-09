@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.recordStreakActivity = recordStreakActivity;
 const requireAuth_1 = require("../middleware/requireAuth");
+const notifications_1 = require("./notifications");
 function toDateKey(date = new Date()) {
     return date.toISOString().split('T')[0];
 }
@@ -52,6 +53,10 @@ async function recordStreakActivity(userId) {
         .single();
     if (updateError || !updated) {
         throw new Error(updateError?.message ?? 'Failed to update streak');
+    }
+    const milestones = [3, 7, 14, 30, 60, 100];
+    if (milestones.includes(nextStreak)) {
+        void (0, notifications_1.notifyStreakMilestone)(userId, nextStreak).catch(() => { });
     }
     return {
         streak_count: updated.streak_count,
