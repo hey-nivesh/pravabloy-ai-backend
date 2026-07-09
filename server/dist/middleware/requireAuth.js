@@ -11,6 +11,7 @@ const supabase_js_1 = require("@supabase/supabase-js");
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const dotenv_1 = __importDefault(require("dotenv"));
+const ws_1 = __importDefault(require("ws"));
 // Dynamically search parent folders for the .env configuration
 const envPaths = [
     path_1.default.join(process.cwd(), '.env'),
@@ -29,12 +30,19 @@ const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 if (!supabaseUrl || !supabaseAnonKey) {
     console.warn('[requireAuth] Supabase configuration environment variables are missing.');
 }
+// Supabase realtime needs Node 22+ native WebSocket, or explicit `ws` transport on Node 20.
+function supabaseOptions(extra) {
+    return {
+        realtime: { transport: ws_1.default },
+        ...extra,
+    };
+}
 // Default client: service role when available (bypasses RLS for server jobs).
 const dbKey = supabaseServiceKey || supabaseAnonKey;
-exports.supabase = (0, supabase_js_1.createClient)(supabaseUrl, dbKey);
+exports.supabase = (0, supabase_js_1.createClient)(supabaseUrl, dbKey, supabaseOptions());
 /** Admin client — always uses service role key. Falls back to default client. */
 exports.supabaseAdmin = supabaseServiceKey
-    ? (0, supabase_js_1.createClient)(supabaseUrl, supabaseServiceKey)
+    ? (0, supabase_js_1.createClient)(supabaseUrl, supabaseServiceKey, supabaseOptions())
     : exports.supabase;
 if (!supabaseServiceKey) {
     console.warn('[requireAuth] SUPABASE_SERVICE_ROLE_KEY is not set. Server DB writes may fail under RLS. ' +
@@ -42,9 +50,7 @@ if (!supabaseServiceKey) {
 }
 /** Supabase client scoped to a user's JWT — satisfies RLS without service role. */
 function createUserSupabase(accessToken) {
-    return (0, supabase_js_1.createClient)(supabaseUrl, supabaseAnonKey, {
-        global: { headers: { Authorization: `Bearer ${accessToken}` } },
-    });
+    return (0, supabase_js_1.createClient)(supabaseUrl, supabaseAnonKey, supabaseOptions({ global: { headers: { Authorization: `Bearer ${accessToken}` } } }));
 }
 /**
  * requireAuth middleware for Express HTTP endpoints.

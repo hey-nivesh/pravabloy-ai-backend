@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import WebSocket from 'ws';
 
 // Dynamically search parent folders for the .env configuration
 const envPaths = [
@@ -26,13 +27,21 @@ if (!supabaseUrl || !supabaseAnonKey) {
   console.warn('[requireAuth] Supabase configuration environment variables are missing.');
 }
 
+// Supabase realtime needs Node 22+ native WebSocket, or explicit `ws` transport on Node 20.
+function supabaseOptions(extra?: Record<string, unknown>) {
+  return {
+    realtime: { transport: WebSocket },
+    ...extra,
+  };
+}
+
 // Default client: service role when available (bypasses RLS for server jobs).
 const dbKey = supabaseServiceKey || supabaseAnonKey;
-export const supabase = createClient(supabaseUrl, dbKey);
+export const supabase = createClient(supabaseUrl, dbKey, supabaseOptions() as never);
 
 /** Admin client — always uses service role key. Falls back to default client. */
 export const supabaseAdmin = supabaseServiceKey
-  ? createClient(supabaseUrl, supabaseServiceKey)
+  ? createClient(supabaseUrl, supabaseServiceKey, supabaseOptions() as never)
   : supabase;
 
 if (!supabaseServiceKey) {
@@ -44,9 +53,11 @@ if (!supabaseServiceKey) {
 
 /** Supabase client scoped to a user's JWT — satisfies RLS without service role. */
 export function createUserSupabase(accessToken: string) {
-  return createClient(supabaseUrl, supabaseAnonKey, {
-    global: { headers: { Authorization: `Bearer ${accessToken}` } },
-  });
+  return createClient(
+    supabaseUrl,
+    supabaseAnonKey,
+    supabaseOptions({ global: { headers: { Authorization: `Bearer ${accessToken}` } } }) as never,
+  );
 }
 
 export interface AuthenticatedRequest extends Request {
