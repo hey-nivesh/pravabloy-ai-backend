@@ -8,7 +8,6 @@ import dotenv from 'dotenv';
 
 import { requireAuth, AuthenticatedRequest, supabase, supabaseAdmin } from './middleware/requireAuth';
 import { setupVoiceGateway } from './ws/voiceGateway';
-import { analyzeSessionById } from './services/analytics';
 import { getLatestAnalyticsReport, getUserProgressSummary } from './services/progress';
 import {
   discoverCorpusWords,
@@ -381,30 +380,13 @@ app.post('/api/v1/vocab-vault/prewarm', async (req, res) => {
   }
 });
 
-app.post('/api/analyze-fluency', requireAuth, async (req: AuthenticatedRequest, res) => {
-  const userId = req.user.id;
-  const { sessionId } = req.body ?? {};
-
-  if (!sessionId || typeof sessionId !== 'string') {
-    return res.status(400).json({ error: 'sessionId is required.' });
-  }
-
-  try {
-    const result = await analyzeSessionById(sessionId, userId);
-    return res.json({
-      ok: true,
-      report: result.report,
-      analysis: result.analysis,
-      transcriptTurnCount: result.transcript.length,
-      model: 'gemini-3.5-flash',
-    });
-  } catch (error: any) {
-    console.error('[analyze-fluency] Failed:', error?.message ?? error);
-    return res.status(500).json({
-      ok: false,
-      error: error?.message ?? 'Failed to generate analysis.',
-    });
-  }
+// Generation moved to Supabase Edge Function `analyze-session` (invoked from Expo client).
+app.post('/api/analyze-fluency', requireAuth, (_req: AuthenticatedRequest, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'Report generation has moved to the analyze-session Supabase Edge Function.',
+    code: 'moved_to_edge_function',
+  });
 });
 
 app.get('/api/progress/summary', requireAuth, async (req: AuthenticatedRequest, res) => {

@@ -1,7 +1,7 @@
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { supabaseAdmin } from '../middleware/requireAuth';
-import { triggerSessionAnalytics, TranscriptTurn } from './analytics';
+import { TranscriptTurn } from './analytics';
 import {
   geminiRateLimiter,
   callWithRetry,
@@ -434,13 +434,11 @@ Where natural, steer the conversation to give the learner an opportunity to use 
     }
     await saveTranscriptToDb();
 
-    const { reportId } = await triggerSessionAnalytics(params.sessionId, params.userId, accumulatedTranscript);
-
     if (sessionObject) {
       try { sessionObject.close(); } catch (_) { /* intentionally ignored */ }
     }
 
-    return { reportId };
+    return { reportId: null };
   };
 
   // ── Public handle ─────────────────────────────────────────────────

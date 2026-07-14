@@ -167,8 +167,8 @@ export function setupVoiceGateway(wss: WebSocket.Server) {
 
       if (notifyClient && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
-          event: 'session_analyzed',
-          payload: { sessionId, reportId },
+          event: 'session_ended',
+          payload: { sessionId },
         }));
       }
 
