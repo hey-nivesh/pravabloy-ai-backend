@@ -75,9 +75,41 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   next(err);
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+app.get(['/health', '/healthz', '/api/health', '/api/v1/health'], async (req: express.Request, res: express.Response) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  let dbStatus = 'healthy';
+  try {
+    const dbPing = supabaseAdmin.from('vocab_vault').select('id', { count: 'exact', head: true }).limit(1);
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 2000));
+    const result: any = await Promise.race([dbPing, timeout]).catch(() => null);
+    if (!result || result.error) {
+      dbStatus = 'degraded';
+    }
+  } catch {
+    dbStatus = 'degraded';
+  }
+
+  const memory = process.memoryUsage();
+  return res.status(200).json({
+    status: dbStatus === 'healthy' ? 'ok' : 'degraded',
+    service: 'pravabloyai-server',
+    environment: process.env.NODE_ENV || 'development',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    services: {
+      database: dbStatus,
+    },
+    memory: {
+      rssMB: Math.round((memory.rss / 1024 / 1024) * 100) / 100,
+      heapUsedMB: Math.round((memory.heapUsed / 1024 / 1024) * 100) / 100,
+      heapTotalMB: Math.round((memory.heapTotal / 1024 / 1024) * 100) / 100,
+    },
+  });
 });
+
 
 async function assembleVocabSession(params: {
   userId: string;

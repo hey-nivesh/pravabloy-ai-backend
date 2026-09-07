@@ -153,8 +153,8 @@ function setupVoiceGateway(wss) {
             }
             if (notifyClient && ws.readyState === ws_1.default.OPEN) {
                 ws.send(JSON.stringify({
-                    event: 'session_analyzed',
-                    payload: { sessionId, reportId },
+                    event: 'session_ended',
+                    payload: { sessionId },
                 }));
             }
             return reportId;

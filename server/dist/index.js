@@ -45,7 +45,6 @@ const ws_1 = __importDefault(require("ws"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const requireAuth_1 = require("./middleware/requireAuth");
 const voiceGateway_1 = require("./ws/voiceGateway");
-const analytics_1 = require("./services/analytics");
 const progress_1 = require("./services/progress");
 const discoverWords_1 = require("./services/vocabulary/discoverWords");
 const pronunciation_1 = require("./services/vocabulary/pronunciation");
@@ -96,8 +95,38 @@ app.use((err, req, res, next) => {
     }
     next(err);
 });
-app.get('/health', (req, res) => {
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+app.get(['/health', '/healthz', '/api/health', '/api/v1/health'], async (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    let dbStatus = 'healthy';
+    try {
+        const dbPing = requireAuth_1.supabaseAdmin.from('vocab_vault').select('id', { count: 'exact', head: true }).limit(1);
+        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 2000));
+        const result = await Promise.race([dbPing, timeout]).catch(() => null);
+        if (!result || result.error) {
+            dbStatus = 'degraded';
+        }
+    }
+    catch {
+        dbStatus = 'degraded';
+    }
+    const memory = process.memoryUsage();
+    return res.status(200).json({
+        status: dbStatus === 'healthy' ? 'ok' : 'degraded',
+        service: 'pravabloyai-server',
+        environment: process.env.NODE_ENV || 'development',
+        uptime: Math.floor(process.uptime()),
+        timestamp: new Date().toISOString(),
+        services: {
+            database: dbStatus,
+        },
+        memory: {
+            rssMB: Math.round((memory.rss / 1024 / 1024) * 100) / 100,
+            heapUsedMB: Math.round((memory.heapUsed / 1024 / 1024) * 100) / 100,
+            heapTotalMB: Math.round((memory.heapTotal / 1024 / 1024) * 100) / 100,
+        },
+    });
 });
 async function assembleVocabSession(params) {
     const { userId, lang, limit } = params;
@@ -362,29 +391,13 @@ app.post('/api/v1/vocab-vault/prewarm', async (req, res) => {
         return res.status(500).json({ error: 'Prewarm job failed.' });
     }
 });
-app.post('/api/analyze-fluency', requireAuth_1.requireAuth, async (req, res) => {
-    const userId = req.user.id;
-    const { sessionId } = req.body ?? {};
-    if (!sessionId || typeof sessionId !== 'string') {
-        return res.status(400).json({ error: 'sessionId is required.' });
-    }
-    try {
-        const result = await (0, analytics_1.analyzeSessionById)(sessionId, userId);
-        return res.json({
-            ok: true,
-            report: result.report,
-            analysis: result.analysis,
-            transcriptTurnCount: result.transcript.length,
-            model: 'gemini-3.5-flash',
-        });
-    }
-    catch (error) {
-        console.error('[analyze-fluency] Failed:', error?.message ?? error);
-        return res.status(500).json({
-            ok: false,
-            error: error?.message ?? 'Failed to generate analysis.',
-        });
-    }
+// Generation moved to Supabase Edge Function `analyze-session` (invoked from Expo client).
+app.post('/api/analyze-fluency', requireAuth_1.requireAuth, (_req, res) => {
+    return res.status(410).json({
+        ok: false,
+        error: 'Report generation has moved to the analyze-session Supabase Edge Function.',
+        code: 'moved_to_edge_function',
+    });
 });
 app.get('/api/progress/summary', requireAuth_1.requireAuth, async (req, res) => {
     const userId = req.user.id;

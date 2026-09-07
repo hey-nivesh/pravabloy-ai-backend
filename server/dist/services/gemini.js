@@ -5,7 +5,6 @@ exports.synthesizeSpeech = synthesizeSpeech;
 exports.generateAiVocab = generateAiVocab;
 const genai_1 = require("@google/genai");
 const requireAuth_1 = require("../middleware/requireAuth");
-const analytics_1 = require("./analytics");
 const rateLimiter_1 = require("../utils/rateLimiter");
 const pcmToWav_1 = require("../utils/pcmToWav");
 /** Dedup concurrent TTS requests for the same text+speed hash */
@@ -361,14 +360,13 @@ Where natural, steer the conversation to give the learner an opportunity to use 
             });
         }
         await saveTranscriptToDb();
-        const { reportId } = await (0, analytics_1.triggerSessionAnalytics)(params.sessionId, params.userId, accumulatedTranscript);
         if (sessionObject) {
             try {
                 sessionObject.close();
             }
             catch (_) { /* intentionally ignored */ }
         }
-        return { reportId };
+        return { reportId: null };
     };
     // ── Public handle ─────────────────────────────────────────────────
     return {
