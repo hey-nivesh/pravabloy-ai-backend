@@ -523,5 +523,5 @@ server.on('upgrade', (request, socket, head) => {
 (0, voiceGateway_1.setupVoiceGateway)(wss);
 server.listen(port, () => {
     console.log(`[PravabloyAI Server] Server running on port ${port}`);
-    console.log(`[PravabloyAI Server] Voice model: gemini-3.1-flash-live-preview (no limits)`);
+    console.log(`[PravabloyAI Server] Voice model:(no limits)`);
 });
